@@ -18,22 +18,99 @@
 namespace {
 
 const std::size_t buffer_size = 1 << 20;
-const std::size_t checksum_size = sizeof(boost::crc_32_type::value_type);
+
+typedef boost::crc_32_type checksum_algo;
+typedef checksum_algo::value_type checksum_type;
+const std::size_t checksum_size = sizeof(checksum_type);
+
+class signature
+{
+public:
+  signature(std::size_t block_size);
+
+  void push(const char* data, std::size_t size);
+  void complete_block();
+
+  void reset_block();
+  void reset();
+
+  void from_file(int fd, off_t offset, std::size_t count);
+  void dump_to_file(int fd, off_t offset);
+
+  const std::size_t block_size;
+
+private:
+  checksum_algo csum;
+  std::vector<checksum_type> output;
+  std::unique_ptr<char[]> buffer;
+  std::size_t block_remaining;
+};
+
+signature::signature(std::size_t block_size)
+  : block_size(block_size)
+  , block_remaining(block_size)
+{}
 
 void
-process_one_block(int fd_in,
-                  int fd_out,
-                  off_t input_offset,
-                  off_t output_offset,
-                  char* buffer,
-                  std::size_t block_size)
+signature::push(const char* data, std::size_t size)
 {
-  boost::crc_32_type crc;
-  auto read_remaining = block_size;
+  while (size) {
+    if (block_remaining == 0) {
+      complete_block();
+    }
+
+    auto chunk = std::min(block_remaining, size);
+    csum.process_bytes(data, chunk);
+
+    size -= chunk;
+    block_remaining -= chunk;
+    data += chunk;
+  }
+
+  if (block_remaining == 0) {
+    complete_block();
+  }
+}
+
+void
+signature::complete_block()
+{
+  if (block_remaining == block_size) {
+    return;
+  }
+
+  output.push_back(csum.checksum());
+  reset_block();
+}
+
+void
+signature::reset_block()
+{
+  csum.reset();
+  block_remaining = block_size;
+}
+
+void
+signature::reset()
+{
+  reset_block();
+  output.clear();
+}
+
+void
+signature::from_file(int fd, off_t offset, std::size_t block_count)
+{
+  auto read_remaining = block_size * block_count;
+
+  output.reserve(output.size() + block_count);
+
+  if (!buffer) {
+    buffer.reset(new char[buffer_size]);
+  }
 
   while (read_remaining) {
     auto n_read =
-      pread(fd_in, buffer, std::min(read_remaining, buffer_size), input_offset);
+      pread(fd, buffer.get(), std::min(read_remaining, buffer_size), offset);
 
     if (n_read < 0) {
       if (errno == EINTR) {
@@ -47,21 +124,22 @@ process_one_block(int fd_in,
       break;
     }
 
-    crc.process_bytes(buffer, n_read);
+    push(buffer.get(), n_read);
     read_remaining -= n_read;
-    input_offset += n_read;
+    offset += n_read;
   }
 
-  if (read_remaining == block_size) {
-    return;
-  }
+  complete_block();
+}
 
-  auto checksum = crc.checksum();
-  auto write_ptr = reinterpret_cast<char*>(&checksum);
-  auto write_remaining = checksum_size;
+void
+signature::dump_to_file(int fd, off_t offset)
+{
+  auto write_ptr = reinterpret_cast<char*>(output.data());
+  auto write_end = reinterpret_cast<char*>(output.data() + output.size());
 
-  while (write_remaining) {
-    auto n_written = pwrite(fd_out, write_ptr, write_remaining, output_offset);
+  while (write_ptr != write_end) {
+    auto n_written = pwrite(fd, write_ptr, write_end - write_ptr, offset);
 
     if (n_written < 0) {
       if (errno == EINTR) {
@@ -71,31 +149,8 @@ process_one_block(int fd_in,
       throw std::system_error(errno, std::generic_category(), "pwrite");
     }
 
-    write_remaining -= n_written;
-    output_offset += n_written;
-  }
-}
-
-void
-process_blocks(int fd_in,
-               int fd_out,
-               std::atomic<off_t>& block_counter,
-               off_t num_blocks,
-               std::size_t block_size)
-{
-  std::unique_ptr<char[]> buffer(new char[std::min(block_size, buffer_size)]);
-
-  for (;;) {
-    auto block_index = block_counter.fetch_add(1, std::memory_order_relaxed);
-    if (block_index >= num_blocks) {
-      break;
-    }
-
-    auto input_offset = block_index * block_size;
-    auto output_offset = block_index * checksum_size;
-
-    process_one_block(
-      fd_in, fd_out, input_offset, output_offset, buffer.get(), block_size);
+    offset += n_written;
+    write_ptr += n_written;
   }
 }
 
@@ -140,13 +195,32 @@ generate_signature(int fd_in,
     concurrency = num_blocks;
   }
 
-  std::atomic<off_t> block_counter(0);
+  auto step = std::max(std::size_t(1), buffer_size / block_size);
+
+  if (step > num_blocks / concurrency) {
+    step = num_blocks / concurrency;
+  }
+
+  std::atomic<unsigned_off_t> block_counter(0);
   std::vector<std::thread> threads;
   std::vector<std::future<void>> futures;
 
   for (unsigned int i = 0; i < concurrency; i++) {
     std::packaged_task<void()> task([&]() {
-      process_blocks(fd_in, fd_out, block_counter, num_blocks, block_size);
+      signature partial_signature(block_size);
+
+      for (;;) {
+        auto block_index =
+          block_counter.fetch_add(step, std::memory_order_relaxed);
+
+        if (block_index >= num_blocks) {
+          break;
+        }
+
+        partial_signature.from_file(fd_in, block_index * block_size, step);
+        partial_signature.dump_to_file(fd_out, block_index * checksum_size);
+        partial_signature.reset();
+      }
     });
 
     futures.push_back(task.get_future());
